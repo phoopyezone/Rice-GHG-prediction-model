@@ -1,644 +1,591 @@
-##### 1_get_wth_soil_data.R #####
-#
-# Download-only DNDC climate and soil inputs for Myanmar.
-# Follows the Oryza downloader style (NASA POWER + geodata SoilGrids),
-# but writes outputs using DNDC variable names and units.
-#
+##### 1_get_wth_soil_data.R - DNDC VERSION #####
+# NASA POWER-based implementation following ORYZA pattern
+# Downloads climate + soil data for Myanmar DNDC simulations
+
 suppressPackageStartupMessages({
   library(nasapower)
   library(terra)
   library(dplyr)
-  library(sf)
+  library(lubridate)
   library(geodata)
+  library(httr)  # For timeout configuration
 })
 
-# -----------------------------------------------------------------------------
-# 0) Paths and setup
-# -----------------------------------------------------------------------------
-sim_root <- Sys.getenv(
-  "DNDC_SIM_DIR",
-  unset = "G:/My Drive/Research/simulation/main_dndc/simulate_dndc"
-)
+# --- PATHS ---
+path <- "G:/My Drive/Research/simulation/main_dndc/simulate_dndc"
 
-raw_weather_dir <- file.path(sim_root, "data", "raw", "weather", "power")
-raw_soil_dir <- file.path(sim_root, "data", "raw", "soil")
-dir.create(raw_weather_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(raw_soil_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(path, FALSE, TRUE)
+setwd(path)
+raw_dir <- file.path("data", "raw")
+power_dir <- file.path(raw_dir, "weather", "power")
+dir.create(power_dir, recursive = TRUE, showWarnings = FALSE)
 
-# Myanmar boundary to derive download extent
-mmr_shp <- file.path(
-  sim_root,
-  "boundaries_shapefiles",
-  "mmr_polbnda2_adm1_250k_mimu_1.shp"
-)
-if (!file.exists(mmr_shp)) {
-  stop("Myanmar boundary shapefile not found: ", mmr_shp)
-}
+# --- CONFIG ---
+# DNDC requires: T2M_MAX, T2M_MIN, T2M (avg), PRECTOTCORR, WS2M, ALLSKY_SFC_SW_DWN, RH2M
+vars <- c("T2M_MAX", "T2M_MIN", "T2M", "PRECTOTCORR", "WS2M", "ALLSKY_SFC_SW_DWN", "RH2M")
+years <- 2005:2024
+ext <- terra::ext(91.5, 101.5, 8, 29)  # xmin, xmax, ymin, ymax (Myanmar)
+bbox <- c(xmin(ext), ymin(ext), xmax(ext), ymax(ext))  # lon_min, lat_min, lon_max, lat_max for nasapower
 
-mmr <- sf::st_read(mmr_shp, quiet = TRUE)
-bb <- sf::st_bbox(mmr)
-
-# Snap to POWER 0.5-degree grid (same pattern as Oryza workflow)
-xmin_dl <- floor(as.numeric(bb["xmin"]) * 2) / 2
-xmax_dl <- ceiling(as.numeric(bb["xmax"]) * 2) / 2
-ymin_dl <- floor(as.numeric(bb["ymin"]) * 2) / 2
-ymax_dl <- ceiling(as.numeric(bb["ymax"]) * 2) / 2
-
-ext_dl <- terra::ext(xmin_dl, xmax_dl, ymin_dl, ymax_dl)
-bbox_power <- c(ymin_dl, xmin_dl, ymax_dl, xmax_dl) # lat_min, lon_min, lat_max, lon_max
-
-years <- 1995:2024
-lon_seq <- seq(xmin_dl, xmax_dl, by = 0.5)
-lat_seq <- seq(ymin_dl, ymax_dl, by = 0.5)
+# Build the target grid (POWER native grid is 0.5-degree)
+lon_seq <- seq(xmin(ext), xmax(ext), by = 0.5)
+lat_seq <- seq(ymin(ext), ymax(ext), by = 0.5)
 lat_seq_desc <- sort(lat_seq, decreasing = TRUE)
 
-message("Download extent: ", paste(round(c(xmin_dl, xmax_dl, ymin_dl, ymax_dl), 2), collapse = ", "))
-message("Simulation root: ", sim_root)
-
-# -----------------------------------------------------------------------------
-# 1) Climate download (NASA POWER) mapped to DNDC variables
-# -----------------------------------------------------------------------------
-# Mapping:
-# - POWER variable      -> DNDC variable name, unit conversion to DNDC unit
-climate_map <- data.frame(
-  power_var = c("T2M_MAX", "T2M_MIN", "T2M", "PRECTOTCORR", "WS2M", "ALLSKY_SFC_SW_DWN", "RH2M"),
-  dndc_var = c(
-    "Daily_max_air_temperature",
-    "Daily_min_air_temperature",
-    "Daily_avg_air_temperature",
-    "Daily_precipitation",
-    "Daily_avg_wind_speed",
-    "Daily_solar_radiation",
-    "Daily_relative_humidity"
-  ),
-  conv_to_dndc = c(1, 1, 1, 0.1, 1, 3.6, 1),
-  stringsAsFactors = FALSE
-)
-
-.make_layer <- function(df, value_col, ext_obj, lon_vals, lat_vals_desc) {
-  r <- terra::rast(
-    ncols = length(lon_vals), nrows = length(lat_vals_desc),
-    xmin = terra::xmin(ext_obj), xmax = terra::xmax(ext_obj),
-    ymin = terra::ymin(ext_obj), ymax = terra::ymax(ext_obj),
-    crs = "EPSG:4326"
-  )
+# Helper: turn a POWER dataframe for a single day into a raster layer
+.make_layer <- function(df, value_col){
+  r <- terra::rast(ncols = length(lon_seq), nrows = length(lat_seq_desc),
+                   xmin = xmin(ext), xmax = xmax(ext), ymin = ymin(ext), ymax = ymax(ext),
+                   crs = "EPSG:4326")
   df_ord <- df |>
     dplyr::arrange(dplyr::desc(LAT), LON)
   terra::values(r) <- df_ord[[value_col]]
   r
 }
 
-.fetch_year <- function(parm, yr, bbox_vals, ext_obj, lon_vals, lat_vals_desc) {
-  d1 <- paste0(yr, "-01-01")
-  d2 <- paste0(yr, "-12-31")
-  dat <- nasapower::get_power(
-    community = "AG",
-    temporal_average = "DAILY",
-    pars = parm,
-    bbox = bbox_vals,
-    dates = c(d1, d2)
-  )
+# Helper: fetch a single year's worth for one parameter using tiles
+# NASA POWER limits: 
+#   - Max 100 points per request (10° x 10° at 0.5° resolution)
+#   - Minimum 2° x 2° per request
+.fetch_year <- function(parm, yr){
+  d1 <- paste0(yr, "-01-01"); d2 <- paste0(yr, "-12-31")
+  
+  # Configure longer timeout for slow server responses (5 minutes)
+  httr::set_config(httr::timeout(300))
+  on.exit(httr::reset_config())  # Reset after function completes
+  
+  # Use 4° x 4° tiles (8x8 points = 64 points, safe margin)
+  tile_size <- 4.0
+  min_size <- 2.0   # NASA POWER minimum
+  
+  # Generate tile grid
+  lon_min <- xmin(ext)
+  lon_max <- xmax(ext)
+  lat_min <- ymin(ext)
+  lat_max <- ymax(ext)
+  
+  # Create tile boundaries ensuring minimum 2° coverage
+  lon_starts <- seq(lon_min, lon_max, by = tile_size)
+  lat_starts <- seq(lat_min, lat_max, by = tile_size)
+  
+  # Adjust last tiles if they would be too small
+  # If remaining space < 2°, extend the second-to-last tile
+  if (length(lon_starts) > 1) {
+    last_lon_extent <- lon_max - lon_starts[length(lon_starts)]
+    if (last_lon_extent < min_size && last_lon_extent > 0) {
+      # Remove last start, extend previous tile
+      lon_starts <- lon_starts[-length(lon_starts)]
+    }
+  }
+  
+  if (length(lat_starts) > 1) {
+    last_lat_extent <- lat_max - lat_starts[length(lat_starts)]
+    if (last_lat_extent < min_size && last_lat_extent > 0) {
+      # Remove last start, extend previous tile
+      lat_starts <- lat_starts[-length(lat_starts)]
+    }
+  }
+  
+  all_tiles_data <- list()
+  tile_count <- 0
+  total_tiles <- length(lon_starts) * length(lat_starts)
+  
+  for (lon_start in lon_starts) {
+    for (lat_start in lat_starts) {
+      tile_count <- tile_count + 1
+      
+      # Calculate tile end
+      lon_end <- min(lon_start + tile_size, lon_max)
+      lat_end <- min(lat_start + tile_size, lat_max)
+      
+      # Verify minimum size
+      tile_lon_size <- lon_end - lon_start
+      tile_lat_size <- lat_end - lat_start
+      
+      message(sprintf("    Tile %d/%d [%.1f-%.1f, %.1f-%.1f] (%.1f° x %.1f°)", 
+                      tile_count, total_tiles,
+                      lon_start, lon_end, lat_start, lat_end,
+                      tile_lon_size, tile_lat_size))
+      
+      # Double check minimum size
+      if (tile_lon_size < min_size || tile_lat_size < min_size) {
+        message(sprintf("      WARNING: Tile smaller than 2° minimum - skipping"))
+        next
+      }
+      
+      tile_bbox <- c(lon_start, lat_start, lon_end, lat_end)
+      
+      # Download with retry logic and increased timeout
+      max_retries <- 5  # Increased from 3
+      success <- FALSE
+      
+      for (attempt in 1:max_retries) {
+        tryCatch({
+          # Set timeout to 5 minutes (configured via httr above)
+          dat_tile <- nasapower::get_power(
+            community = "ag",
+            lonlat = tile_bbox,
+            pars = parm,
+            dates = c(d1, d2),
+            temporal_api = "daily"
+          )
+          all_tiles_data[[length(all_tiles_data) + 1]] <- dat_tile
+          success <- TRUE
+          
+          # Add delay to avoid rate limiting
+          Sys.sleep(3)  # Increased to 3 seconds
+          break
+          
+        }, error = function(e) {
+          err_msg <- as.character(e)
+          
+          if (grepl("Timeout", err_msg) || grepl("timed out", err_msg, ignore.case = TRUE)) {
+            wait_time <- 30 * attempt  # 30s, 60s, 90s, 120s, 150s
+            message(sprintf("      Timeout. Waiting %d seconds... (attempt %d/%d)", 
+                            wait_time, attempt, max_retries))
+            Sys.sleep(wait_time)
+            if (attempt == max_retries) {
+              message(sprintf("      Max retries exceeded. Skipping this tile."))
+              message(sprintf("      This year may be incomplete. Rerun script to retry."))
+              return(NULL)  # Skip this tile but continue
+            }
+          } else if (grepl("429", err_msg) || grepl("rate limit", err_msg, ignore.case = TRUE)) {
+            wait_time <- 120 * attempt  # 2 min, 4 min, 6 min
+            message(sprintf("      Rate limited. Waiting %d seconds... (attempt %d/%d)", 
+                            wait_time, attempt, max_retries))
+            Sys.sleep(wait_time)
+            if (attempt == max_retries) {
+              stop("Max retries exceeded due to rate limiting. Wait 1 hour and try again.")
+            }
+          } else {
+            message(sprintf("      ERROR: %s", err_msg))
+            if (attempt == max_retries) {
+              message(sprintf("      Max retries exceeded. Skipping this tile."))
+              return(NULL)  # Skip this tile but continue
+            }
+            Sys.sleep(20)
+          }
+        })
+      }
+      
+      if (!success) {
+        warning(sprintf("Tile %d failed to download", tile_count))
+      }
+    }
+  }
+  
+  # Combine all tiles
+  if (length(all_tiles_data) == 0) {
+    stop("No tiles were successfully downloaded")
+  }
+  
+  message(sprintf("    Successfully downloaded %d/%d tiles", 
+                  length(all_tiles_data), total_tiles))
+  
+  dat <- dplyr::bind_rows(all_tiles_data)
   dat <- dplyr::rename(dat, DATE = YYYYMMDD)
   dat$DATE <- as.Date(dat$DATE)
-
+  
+  # Remove duplicates (from overlapping tiles)
+  dat <- dat[!duplicated(dat[, c("LAT", "LON", "DATE")]), ]
+  
+  # Create raster layers
   days <- sort(unique(dat$DATE))
   layers <- vector("list", length(days))
-  for (i in seq_along(days)) {
+  for (i in seq_along(days)){
     dd <- dat[dat$DATE == days[i], c("LAT", "LON", parm)]
-    layers[[i]] <- .make_layer(dd, parm, ext_obj, lon_vals, lat_vals_desc)
+    layers[[i]] <- .make_layer(dd, parm)
   }
-
+  
   r <- terra::rast(layers)
   terra::time(r) <- days
   names(r) <- paste0(parm, "_", format(days, "%Y%j"))
   r
 }
 
-.get_or_download_power <- function(parm) {
-  fn_raw <- file.path(raw_weather_dir, sprintf("%s-1995_2024-myanmar.nc", parm))
-  if (file.exists(fn_raw)) {
-    message("Found existing POWER file: ", basename(fn_raw))
-    return(terra::rast(fn_raw))
+# Helper: load if exists AND is valid; otherwise fetch all years and write a single NetCDF per variable
+.get_or_load_var <- function(parm){
+  fn_raw <- file.path(power_dir, sprintf("%s-2005_2024-91.5x101.5x8x29.nc", parm))
+  
+  # Check if file exists and is valid
+  if (file.exists(fn_raw)){
+    message("Found existing ", basename(fn_raw), "; validating...")
+    
+    # Try to load - if it fails, file is corrupted
+    valid <- tryCatch({
+      test_load <- terra::rast(fn_raw)
+      TRUE
+    }, error = function(e) {
+      message("  File is corrupted or unreadable. Will re-download.")
+      FALSE
+    })
+    
+    if (valid) {
+      message("  File is valid; loading...")
+      return(terra::rast(fn_raw))
+    } else {
+      # Delete corrupted file
+      file.remove(fn_raw)
+      message("  Deleted corrupted file")
+    }
   }
-
-  message("Downloading POWER variable: ", parm)
-  rs <- lapply(years, function(yy) {
-    message("  - Year ", yy)
-    .fetch_year(parm, yy, bbox_power, ext_dl, lon_seq, lat_seq_desc)
-  })
+  
+  message("Downloading ", parm, " (this will take 10-20 minutes per year with rate limiting)")
+  message("Progress: 0/", length(years), " years")
+  
+  rs <- list()
+  for (i in seq_along(years)) {
+    yy <- years[i]
+    message(sprintf("  Year %d (%d/%d)", yy, i, length(years)))
+    rs[[i]] <- .fetch_year(parm, yy)
+  }
+  
+  message("  Combining years and writing NetCDF...")
   R <- terra::rast(rs)
   terra::writeCDF(R, fn_raw, varname = parm, longname = parm, overwrite = TRUE)
+  message("  ✓ Complete: ", basename(fn_raw))
   R
 }
 
-for (i in seq_len(nrow(climate_map))) {
-  power_var <- climate_map$power_var[i]
-  dndc_var <- climate_map$dndc_var[i]
-  conv <- climate_map$conv_to_dndc[i]
-
-  raw_r <- .get_or_download_power(power_var)
-
-  fn_dndc <- file.path(raw_weather_dir, sprintf("%s-1995_2024-myanmar.nc", dndc_var))
-  if (!file.exists(fn_dndc)) {
-    message("Writing DNDC climate variable: ", dndc_var)
-    dndc_r <- raw_r * conv
-    terra::writeCDF(dndc_r, fn_dndc, varname = dndc_var, longname = dndc_var, overwrite = TRUE)
-  } else {
-    message("Found existing DNDC climate file: ", basename(fn_dndc))
-  }
-}
+# -----------------------------------------------------------------------------
+# 1) Download (or load existing) raw POWER variables
+# -----------------------------------------------------------------------------
+message("=== Downloading DNDC Climate Variables ===")
+message("NOTE: NASA POWER API has rate limits and 100-point request limits")
+message("      Myanmar grid will be downloaded in tiles with 2-second delays")
+message("      Expected time: 3-6 hours for all variables (2005-2024)")
+message("      Downloads are resume-safe - rerun if interrupted")
+message("")
+R_TMAX     <- .get_or_load_var("T2M_MAX")            # °C
+R_TMIN     <- .get_or_load_var("T2M_MIN")            # °C
+R_TAVG     <- .get_or_load_var("T2M")                # °C (daily average)
+R_PREC     <- .get_or_load_var("PRECTOTCORR")        # mm day-1
+R_WIND     <- .get_or_load_var("WS2M")               # m s-1
+R_ALLSKY   <- .get_or_load_var("ALLSKY_SFC_SW_DWN")  # kWh m-2 day-1
+R_RH       <- .get_or_load_var("RH2M")               # % relative humidity
 
 # -----------------------------------------------------------------------------
-# 2) Soil download (SoilGrids via geodata) mapped to DNDC variables
+# 2) Create DNDC-unit derived products
 # -----------------------------------------------------------------------------
-# Download top-layer source variables needed to build selected DNDC inputs.
-soil_src_vars <- c("bdod", "clay", "soc", "phh2o", "sand", "silt")
-soil_depths <- c(5) # top layer only
+message("=== Converting to DNDC Units ===")
 
-soil_src_tif <- file.path(raw_soil_dir, "soilgrids_top_0_5cm_source.tif")
-if (!file.exists(soil_src_tif)) {
-  message("Downloading SoilGrids source layers (top 0-5 cm)...")
-  soil_src <- geodata::soil_world(soil_src_vars, soil_depths, stat = "mean", path = raw_soil_dir)
-  soil_src <- terra::crop(soil_src, ext_dl)
-  terra::writeRaster(soil_src, soil_src_tif, overwrite = TRUE)
+# Tmax: already in °C, just copy
+fn_tmax <- file.path(power_dir, "tmax-2005_2024-91.5x101.5x8x29.nc")
+if (!file.exists(fn_tmax)){
+  terra::writeCDF(R_TMAX, fn_tmax, varname = "tmax", longname = "Daily Max Temperature", unit = "C", overwrite = TRUE)
+  message("✓ Tmax converted")
 } else {
-  message("Found existing SoilGrids source file: ", basename(soil_src_tif))
-  soil_src <- terra::rast(soil_src_tif)
+  message("✓ Tmax already exists")
 }
 
-# Convert/write DNDC soil variables from downloaded source layers.
-soil_outputs <- list(
-  Bulk_density = list(src = "bdod_0-5cm", conv = 1 / 100),   # cg/cm3 -> g/cm3
-  Clay_fraction = list(src = "clay_0-5cm", conv = 1 / 1000), # g/kg -> fraction
-  Top_layer_SOC = list(src = "soc_0-5cm", conv = 1 / 1000),  # g/kg (scaled) -> fraction
-  pH = list(src = "phh2o_0-5cm", conv = 1 / 10),             # pH*10 -> pH
-  sand_pct = list(src = "sand_0-5cm", conv = 1 / 10),        # g/kg -> %
-  silt_pct = list(src = "silt_0-5cm", conv = 1 / 10)         # g/kg -> %
-)
-
-for (nm in names(soil_outputs)) {
-  src_name <- soil_outputs[[nm]]$src
-  conv <- soil_outputs[[nm]]$conv
-
-  if (!(src_name %in% names(soil_src))) {
-    warning("Soil layer missing in downloaded stack: ", src_name)
-    next
-  }
-
-  out_tif <- file.path(raw_soil_dir, paste0(nm, "_myanmar.tif"))
-  if (!file.exists(out_tif)) {
-    message("Writing DNDC soil variable: ", nm)
-    r <- soil_src[[src_name]] * conv
-    terra::writeRaster(r, out_tif, overwrite = TRUE)
-  } else {
-    message("Found existing DNDC soil file: ", basename(out_tif))
-  }
+# Tmin: already in °C, just copy
+fn_tmin <- file.path(power_dir, "tmin-2005_2024-91.5x101.5x8x29.nc")
+if (!file.exists(fn_tmin)){
+  terra::writeCDF(R_TMIN, fn_tmin, varname = "tmin", longname = "Daily Min Temperature", unit = "C", overwrite = TRUE)
+  message("✓ Tmin converted")
+} else {
+  message("✓ Tmin already exists")
 }
 
-message("Download step complete.")
-message("Climate outputs: ", raw_weather_dir)
-message("Soil outputs: ", raw_soil_dir)
+# Tavg: already in °C, just copy
+fn_tavg <- file.path(power_dir, "tavg-2005_2024-91.5x101.5x8x29.nc")
+if (!file.exists(fn_tavg)){
+  terra::writeCDF(R_TAVG, fn_tavg, varname = "tavg", longname = "Daily Avg Temperature", unit = "C", overwrite = TRUE)
+  message("✓ Tavg converted")
+} else {
+  message("✓ Tavg already exists")
+}
 
-##### END OF FILE #####
-# 1_get_wth_soil_data.R - COMPLETE VERSION WITH DOWNLOADS
-# Myanmar-only DNDC data preparation: climate + soil acquisition and harmonization
-# Uses NASA POWER for climate (no account needed), SoilGrids for soil
-
-library(terra)
-library(sf)
-library(tidyverse)
-library(nasapower)  # For climate data
-library(httr)       # For SoilGrids downloads
-library(lubridate)
-
-# ============================================================================
-# 0. CONFIGURATION & SETUP
-# ============================================================================
-base_dir <- "G:/My Drive/Research/simulation/main_dndc/simulate_dndc"
-
-# Create directory structure
-dirs <- c(
-  file.path(base_dir, "data/raw/climate"),
-  file.path(base_dir, "data/raw/soil"),
-  file.path(base_dir, "data/raw/mask"),
-  file.path(base_dir, "data/processed/climate"),
-  file.path(base_dir, "data/processed/soil"),
-  file.path(base_dir, "data/processed/tables"),
-  file.path(base_dir, "dndc_inputs/climate_files")
-)
-for (d in dirs) dir.create(d, recursive = TRUE, showWarnings = FALSE)
-
-# Simulation period
-sim_years <- 2005:2024
-
-# Myanmar boundary
-mmr_boundary <- st_read(file.path(base_dir, "boundaries_shapefiles/mmr_polbnda2_adm1_250k_mimu_1.shp"))
-mmr_bbox <- st_bbox(mmr_boundary)
-
-cat("Myanmar Bounding Box:\n")
-cat(sprintf("  Lat: %.2f to %.2f\n", mmr_bbox["ymin"], mmr_bbox["ymax"]))
-cat(sprintf("  Lon: %.2f to %.2f\n\n", mmr_bbox["xmin"], mmr_bbox["xmax"]))
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-# Function to download NASA POWER data for Myanmar
-download_nasa_power <- function(parameter, year, bbox, output_file) {
-  if (file.exists(output_file)) {
-    cat(" [EXISTS]")
-    return(TRUE)
+# Precipitation: mm to cm (divide by 10)
+fn_prec <- file.path(power_dir, "prec-2005_2024-91.5x101.5x8x29.nc")
+if (!file.exists(fn_prec)){
+  prec_file <- file.path(power_dir, "PRECTOTCORR-2005_2024-91.5x101.5x8x29.nc")
+  
+  if (!file.exists(prec_file)) {
+    message("✗ PRECTOTCORR file missing")
+    stop("Missing PRECTOTCORR file - rerun script")
   }
   
-  tryCatch({
-    # NASA POWER API call
-    dates <- c(paste0(year, "-01-01"), paste0(year, "-12-31"))
-    
-    # Download point data for Myanmar grid
-    lon_seq <- seq(bbox["xmin"], bbox["xmax"], by = 0.5)
-    lat_seq <- seq(bbox["ymin"], bbox["ymax"], by = 0.5)
-    
-    # Create grid of points
-    grid_points <- expand.grid(lon = lon_seq, lat = lat_seq)
-    
-    cat(sprintf(" [Downloading %d points]", nrow(grid_points)))
-    
-    # Download for each point (NASA POWER limitation)
-    all_data <- list()
-    for (i in 1:nrow(grid_points)) {
-      pt_data <- get_power(
-        community = "ag",
-        lonlat = c(grid_points$lon[i], grid_points$lat[i]),
-        pars = parameter,
-        dates = dates,
-        temporal_api = "daily"
-      )
-      pt_data$lon <- grid_points$lon[i]
-      pt_data$lat <- grid_points$lat[i]
-      all_data[[i]] <- pt_data
-      
-      if (i %% 10 == 0) cat(sprintf("\r    Progress: %d/%d", i, nrow(grid_points)))
-    }
-    
-    # Combine all data
-    combined_data <- bind_rows(all_data)
-    
-    # Convert to raster
-    dates_seq <- seq(as.Date(dates[1]), as.Date(dates[2]), by = "day")
-    n_days <- length(dates_seq)
-    
-    # Create raster stack
-    r_list <- list()
-    for (d in 1:n_days) {
-      day_data <- combined_data %>%
-        filter(YYYYMMDD == format(dates_seq[d], "%Y%m%d")) %>%
-        select(lon, lat, value = all_of(parameter))
-      
-      # Convert to raster
-      r <- rast(day_data, type = "xyz", crs = "EPSG:4326")
-      r_list[[d]] <- r
-    }
-    
-    # Stack all days
-    r_stack <- rast(r_list)
-    names(r_stack) <- paste0("day_", 1:n_days)
-    
-    # Save as NetCDF
-    writeCDF(r_stack, output_file, overwrite = TRUE)
-    cat(" ???\n")
-    return(TRUE)
-    
+  R_PREC <- tryCatch({
+    terra::rast(prec_file)
   }, error = function(e) {
-    cat(sprintf(" [ERROR: %s]\n", e$message))
-    return(FALSE)
+    message("✗ PRECTOTCORR file is corrupted")
+    file.remove(prec_file)
+    stop("Corrupted PRECTOTCORR file - deleted. Please rerun script.")
   })
+  
+  prec <- R_PREC / 10  # mm -> cm
+  terra::writeCDF(prec, fn_prec, varname = "prec", longname = "Daily Precipitation", unit = "cm", overwrite = TRUE)
+  rm(R_PREC, prec)
+  message("✓ Precipitation converted (mm → cm)")
+} else {
+  message("✓ Precipitation already exists")
 }
 
-# Function to download SoilGrids data
-download_soilgrids <- function(variable, depth = "0-5cm", bbox, output_file) {
-  if (file.exists(output_file)) {
-    cat(" [EXISTS]")
-    return(TRUE)
+# Wind: already in m/s, just copy
+fn_wind <- file.path(power_dir, "wind-2005_2024-91.5x101.5x8x29.nc")
+if (!file.exists(fn_wind)){
+  ws2m_file <- file.path(power_dir, "WS2M-2005_2024-91.5x101.5x8x29.nc")
+  
+  if (!file.exists(ws2m_file)) {
+    message("✗ WS2M file missing - need to re-download")
+    message("  Rerun script to download WS2M")
+    stop("Missing WS2M file")
   }
   
-  tryCatch({
-    # SoilGrids variable mapping
-    sg_vars <- list(
-      bd = "bdod",         # Bulk density
-      clay = "clay",       # Clay content
-      soc = "soc",         # Soil organic carbon
-      ph = "phh2o",        # pH in H2O
-      sand = "sand",       # Sand content
-      silt = "silt"        # Silt content
-    )
-    
-    sg_var <- sg_vars[[variable]]
-    if (is.null(sg_var)) {
-      cat(" [UNKNOWN VARIABLE]")
-      return(FALSE)
-    }
-    
-    # SoilGrids WCS endpoint
-    base_url <- "https://maps.isric.org/mapserv"
-    
-    # Build WCS request
-    wcs_request <- list(
-      service = "WCS",
-      version = "2.0.1",
-      request = "GetCoverage",
-      coverageid = paste0(sg_var, "_", depth, "_mean"),
-      subset = paste0("Lat(", bbox["ymin"], ",", bbox["ymax"], ")"),
-      subset = paste0("Long(", bbox["xmin"], ",", bbox["xmax"], ")"),
-      format = "image/tiff"
-    )
-    
-    cat(" [Downloading from SoilGrids]")
-    
-    # Download using httr
-    response <- GET(base_url, query = wcs_request, timeout(300))
-    
-    if (status_code(response) == 200) {
-      # Save to file
-      writeBin(content(response, "raw"), output_file)
-      cat(" ???\n")
-      return(TRUE)
-    } else {
-      cat(sprintf(" [HTTP ERROR: %d]\n", status_code(response)))
-      return(FALSE)
-    }
-    
+  # Validate file before loading
+  R_WIND <- tryCatch({
+    terra::rast(ws2m_file)
   }, error = function(e) {
-    cat(sprintf(" [ERROR: %s]\n", e$message))
-    return(FALSE)
+    message("✗ WS2M file is corrupted")
+    message("  Deleting corrupted file...")
+    file.remove(ws2m_file)
+    message("  Rerun script to re-download WS2M")
+    stop("Corrupted WS2M file - deleted. Please rerun script.")
   })
+  
+  terra::writeCDF(R_WIND, fn_wind, varname = "wind", longname = "Wind Speed", unit = "m/s", overwrite = TRUE)
+  rm(R_WIND)
+  message("✓ Wind converted")
+} else {
+  message("✓ Wind already exists")
 }
 
-# ============================================================================
-# 1. DOWNLOAD AND PROCESS CLIMATE DATA (ESTABLISHES GRID)
-# ============================================================================
-
-cat("\n=== DOWNLOADING CLIMATE DATA ===\n")
-cat("Using NASA POWER API (0.5?? resolution)\n\n")
-
-# NASA POWER parameter mapping
-nasa_params <- list(
-  tmax = "T2M_MAX",
-  tmin = "T2M_MIN",
-  tavg = "T2M",
-  prec = "PRECTOTCORR",
-  wind = "WS2M",
-  srad = "ALLSKY_SFC_SW_DWN",
-  rhum = "RH2M"
-)
-
-# Conversion factors for DNDC units
-conv_factors <- list(
-  tmax = 1,      # ??C to ??C
-  tmin = 1,      # ??C to ??C
-  tavg = 1,      # ??C to ??C
-  prec = 0.1,    # mm to cm
-  wind = 1,      # m/s to m/s
-  srad = 3.6,    # kWh/m??/day to MJ/m??/day
-  rhum = 1       # % to %
-)
-
-for (year in sim_years) {
-  cat(sprintf("\nYear %d:\n", year))
+# Solar radiation: kWh m-2 d-1 to MJ m-2 d-1 (multiply by 3.6)
+fn_srad <- file.path(power_dir, "srad-2005_2024-91.5x101.5x8x29.nc")
+if (!file.exists(fn_srad)){
+  allsky_file <- file.path(power_dir, "ALLSKY_SFC_SW_DWN-2005_2024-91.5x101.5x8x29.nc")
   
-  for (vname in names(nasa_params)) {
-    param <- nasa_params[[vname]]
-    conv <- conv_factors[[vname]]
-    
-    cat(sprintf("  %s (%s)...", vname, param))
-    
-    # File paths
-    raw_file <- file.path(base_dir, "data/raw/climate", 
-                          sprintf("%s_%d_native.nc", vname, year))
-    proc_file <- file.path(base_dir, "data/processed/climate",
-                           sprintf("%s_%d_dndc.nc", vname, year))
-    
-    # Download if needed
-    success <- download_nasa_power(param, year, mmr_bbox, raw_file)
-    
-    # Convert to DNDC units
-    if (success && file.exists(raw_file)) {
-      if (!file.exists(proc_file)) {
-        r_native <- rast(raw_file)
-        r_dndc <- r_native * conv
-        writeCDF(r_dndc, proc_file, overwrite = TRUE)
-        cat("  ??? Converted to DNDC units ???")
-      } else {
-        cat("  ??? Already processed ???")
-      }
-    }
-    cat("\n")
+  if (!file.exists(allsky_file)) {
+    message("✗ ALLSKY_SFC_SW_DWN file missing")
+    stop("Missing ALLSKY file - rerun script")
   }
+  
+  R_ALLSKY <- tryCatch({
+    terra::rast(allsky_file)
+  }, error = function(e) {
+    message("✗ ALLSKY_SFC_SW_DWN file is corrupted")
+    file.remove(allsky_file)
+    stop("Corrupted ALLSKY file - deleted. Please rerun script.")
+  })
+  
+  srad <- R_ALLSKY * 3.6  # kWh m-2 d-1 -> MJ m-2 d-1
+  terra::writeCDF(srad, fn_srad, varname = "srad", longname = "Solar Radiation", unit = "MJ/m2/day", overwrite = TRUE)
+  rm(R_ALLSKY, srad)
+  message("✓ Solar radiation converted (kWh → MJ)")
+} else {
+  message("✓ Solar radiation already exists")
 }
 
-# ============================================================================
-# 2. DOWNLOAD AND PROCESS SOIL DATA (HARMONIZE TO CLIMATE GRID)
-# ============================================================================
-
-cat("\n=== DOWNLOADING SOIL DATA ===\n")
-cat("Using SoilGrids 250m\n\n")
-
-# Get reference climate grid
-ref_climate_file <- file.path(base_dir, "data/processed/climate", 
-                              sprintf("tmax_%d_dndc.nc", sim_years[1]))
-
-if (!file.exists(ref_climate_file)) {
-  stop("ERROR: Reference climate file not found. Climate data must be downloaded first.")
+# Relative humidity: already in %, just copy
+fn_rhum <- file.path(power_dir, "rhum-2005_2024-91.5x101.5x8x29.nc")
+if (!file.exists(fn_rhum)){
+  rh2m_file <- file.path(power_dir, "RH2M-2005_2024-91.5x101.5x8x29.nc")
+  
+  if (!file.exists(rh2m_file)) {
+    message("✗ RH2M file missing")
+    stop("Missing RH2M file - rerun script")
+  }
+  
+  R_RH <- tryCatch({
+    terra::rast(rh2m_file)
+  }, error = function(e) {
+    message("✗ RH2M file is corrupted")
+    file.remove(rh2m_file)
+    stop("Corrupted RH2M file - deleted. Please rerun script.")
+  })
+  
+  terra::writeCDF(R_RH, fn_rhum, varname = "rhum", longname = "Relative Humidity", unit = "%", overwrite = TRUE)
+  rm(R_RH)
+  message("✓ Relative humidity converted")
+} else {
+  message("✓ Relative humidity already exists")
 }
 
-ref_grid <- rast(ref_climate_file)[[1]]
-cat(sprintf("Reference grid: %d ?? %d cells, %.4f?? resolution\n\n", 
-            ncol(ref_grid), nrow(ref_grid), res(ref_grid)[1]))
+message("✓ Climate data ready in DNDC units")
 
-# Soil variables
-soil_downloads <- list(
-  bd = list(sg_var = "bd", depth = "0-5cm", conv = 100),      # cg/cm?? to g/cm??
-  clay = list(sg_var = "clay", depth = "0-5cm", conv = 0.001), # g/kg to fraction  
-  soc = list(sg_var = "soc", depth = "0-5cm", conv = 0.001),   # dg/kg to fraction
-  ph = list(sg_var = "ph", depth = "0-5cm", conv = 0.1),       # pH*10 to pH
-  sand = list(sg_var = "sand", depth = "0-5cm", conv = 0.001),
-  silt = list(sg_var = "silt", depth = "0-5cm", conv = 0.001)
-)
+# -----------------------------------------------------------------------------
+# 3) Elevation (for reference, using same approach as ORYZA)
+# -----------------------------------------------------------------------------
+message("=== Processing Elevation ===")
+elv_tif <- file.path(raw_dir, "elevation.tif")
+if (!file.exists(elv_tif)){
+  # Load reference grid from saved tmax file
+  ref_tmax <- terra::rast(file.path(power_dir, "T2M_MAX-2005_2024-91.5x101.5x8x29.nc"))
+  
+  elv <- geodata::elevation_30s("Myanmar", path = raw_dir)
+  elv <- terra::resample(elv, ref_tmax[[1]], "average", filename = elv_tif)
+  rm(ref_tmax, elv)
+  message("✓ Elevation processed")
+} else {
+  message("✓ Elevation already exists")
+}
+message("✓ Elevation ready")
 
-for (sname in names(soil_downloads)) {
-  sinfo <- soil_downloads[[sname]]
-  cat(sprintf("%s...", sname))
+# -----------------------------------------------------------------------------
+# 4) Soil (using geodata like ORYZA, but DNDC variables)
+# -----------------------------------------------------------------------------
+message("=== Processing Soil Data ===")
+soil_tif <- file.path(raw_dir, "soil.tif")
+soil_agg_tif <- file.path(raw_dir, "soil_agg.tif")
+
+if (!file.exists(soil_agg_tif)){
+  # Load reference elevation for resampling
+  elv_ref <- terra::rast(elv_tif)
   
-  # Download raw
-  raw_file <- file.path(base_dir, "data/raw/soil",
-                        sprintf("%s_mmr_native.tif", sname))
-  proc_file <- file.path(base_dir, "data/processed/soil",
-                         sprintf("%s_dndc_on_climategrid.tif", sname))
-  
-  # Download
-  download_soilgrids(sinfo$sg_var, sinfo$depth, mmr_bbox, raw_file)
-  
-  # Process if downloaded
-  if (file.exists(raw_file) && !file.exists(proc_file)) {
-    cat("  ??? Processing...")
+  if (!file.exists(soil_tif)){
+    # DNDC needs: bdod, clay, sand, silt, soc, phh2o
+    vars_soil <- c("bdod", "clay", "sand", "silt", "soc", "phh2o")
+    depths <- c(5, 15, 30)  # 0-5cm, 5-15cm, 15-30cm
+    message("  Downloading soil data from SoilGrids...")
+    soil <- geodata::soil_world(vars_soil, depths, stat = "mean", vsi = TRUE)
     
-    s_raw <- rast(raw_file)
-    s_crop <- crop(s_raw, mmr_boundary)
-    s_mask <- mask(s_crop, vect(mmr_boundary))
+    # Debug: show what layer names we actually got
+    message("  Available soil layers: ", paste(names(soil), collapse = ", "))
     
-    # Apply conversion
-    s_converted <- s_mask * sinfo$conv
-    
-    # Resample to climate grid
-    s_final <- resample(s_converted, ref_grid, method = "bilinear")
-    
-    writeRaster(s_final, proc_file, overwrite = TRUE)
-    cat(" ???\n")
-  } else if (file.exists(proc_file)) {
-    cat(" ??? Already processed ???\n")
+    soil <- terra::crop(soil, ext, filename = soil_tif)
   } else {
-    cat("\n")
+    message("  Loading existing soil data...")
+    soil <- terra::rast(soil_tif)
+    message("  Available soil layers: ", paste(names(soil), collapse = ", "))
+    
+    # Check if this is a partially processed file (has mixed layer names)
+    layer_names <- names(soil)
+    has_mean_suffix <- any(grepl("_mean$", layer_names))
+    has_converted <- any(!grepl("_mean$", layer_names) & grepl("bdod|clay|sand|silt|soc|phh2o", layer_names))
+    
+    if (has_mean_suffix && has_converted) {
+      message("  ⚠️  Detected partially processed soil file (mixed layer names)")
+      message("  Deleting and re-downloading for clean data...")
+      file.remove(soil_tif)
+      
+      # Re-download
+      vars_soil <- c("bdod", "clay", "sand", "silt", "soc", "phh2o")
+      depths <- c(5, 15, 30)
+      soil <- geodata::soil_world(vars_soil, depths, stat = "mean", vsi = TRUE)
+      soil <- terra::crop(soil, ext, filename = soil_tif)
+      message("  ✓ Fresh soil data downloaded")
+    }
   }
-}
-
-# Calculate porosity from bulk density if not available
-poros_file <- file.path(base_dir, "data/processed/soil", "poros_dndc_on_climategrid.tif")
-bd_file <- file.path(base_dir, "data/processed/soil", "bd_dndc_on_climategrid.tif")
-
-if (!file.exists(poros_file) && file.exists(bd_file)) {
-  cat("Calculating porosity from bulk density...\n")
-  bd <- rast(bd_file)
-  # Porosity = 1 - (BD / 2.65), where 2.65 is particle density
-  poros <- 1 - (bd / 2.65)
-  writeRaster(poros, poros_file, overwrite = TRUE)
-  cat("  Porosity calculated ???\n")
-}
-
-# Calculate soil texture ID from sand/silt/clay
-texture_file <- file.path(base_dir, "data/processed/soil", "texture_dndc_on_climategrid.tif")
-clay_file <- file.path(base_dir, "data/processed/soil", "clay_dndc_on_climategrid.tif")
-sand_file <- file.path(base_dir, "data/processed/soil", "sand_dndc_on_climategrid.tif")
-silt_file <- file.path(base_dir, "data/processed/soil", "silt_dndc_on_climategrid.tif")
-
-if (!file.exists(texture_file) && all(file.exists(c(clay_file, sand_file, silt_file)))) {
-  cat("Calculating soil texture class...\n")
   
-  clay <- rast(clay_file) * 100  # Convert back to %
-  sand <- rast(sand_file) * 100
-  silt <- rast(silt_file) * 100
   
-  # USDA texture classification (simplified)
-  # 1=sand, 2=loamy sand, 3=sandy loam, 4=loam, 5=silt loam, 
-  # 6=silt, 7=sandy clay loam, 8=clay loam, 9=silty clay loam, 10=sandy clay, 11=silty clay, 12=clay
+  # ---------------------------------------------------------------------------
+  # Dynamic layer lookup - robust to _mean suffix or not
+  # ---------------------------------------------------------------------------
+  .get_soil_layer <- function(r, prefix) {
+    n <- names(r)
+    if (prefix %in% n)                          return(r[[prefix]])
+    if (paste0(prefix, "_mean") %in% n)         return(r[[paste0(prefix, "_mean")]])
+    matches <- grep(paste0("^", prefix), n, value = TRUE)
+    if (length(matches) > 0)                    return(r[[matches[1]]])
+    stop(sprintf("Cannot find layer '%s'. Available: %s", prefix, paste(n, collapse=", ")))
+  }
   
-  texture <- clay  # Start with clay raster structure
-  texture[] <- 4   # Default to loam
+  message("  Converting units...")
   
-  # Clay (> 40% clay)
-  texture[clay > 40 & sand > 45] <- 10  # Sandy clay
-  texture[clay > 40 & silt > 40] <- 11  # Silty clay
-  texture[clay > 40 & sand <= 45 & silt <= 40] <- 12  # Clay
+  # Bulk density: cg/cm3 to g/cm3 (divide by 100)
+  soil[["bdod_0-5cm"]]   <- .get_soil_layer(soil, "bdod_0-5cm")   / 100
+  soil[["bdod_5-15cm"]]  <- .get_soil_layer(soil, "bdod_5-15cm")  / 100
+  soil[["bdod_15-30cm"]] <- .get_soil_layer(soil, "bdod_15-30cm") / 100
   
-  # Clay loam (27-40% clay)
-  texture[clay >= 27 & clay <= 40 & sand > 20 & sand < 45] <- 7  # Sandy clay loam
-  texture[clay >= 27 & clay <= 40 & silt > 40] <- 9  # Silty clay loam
-  texture[clay >= 27 & clay <= 40 & sand >= 20 & sand <= 45 & silt <= 40] <- 8  # Clay loam
+  # Clay, sand, silt: g/kg to fraction (divide by 1000)
+  soil[["clay_0-5cm"]]   <- .get_soil_layer(soil, "clay_0-5cm")   / 1000
+  soil[["sand_0-5cm"]]   <- .get_soil_layer(soil, "sand_0-5cm")   / 1000
+  soil[["silt_0-5cm"]]   <- .get_soil_layer(soil, "silt_0-5cm")   / 1000
   
-  # Loam (7-27% clay)
-  texture[clay < 27 & clay >= 7 & sand < 50 & silt >= 28] <- 5  # Silt loam
-  texture[clay < 27 & clay >= 7 & silt >= 80] <- 6  # Silt
-  texture[clay < 27 & clay >= 7 & sand >= 23 & sand < 52 & silt < 50] <- 4  # Loam
-  texture[clay < 27 & clay >= 7 & sand >= 50] <- 3  # Sandy loam
+  # SOC: dg/kg to fraction (divide by 1000)
+  soil[["soc_0-5cm"]]    <- .get_soil_layer(soil, "soc_0-5cm")    / 1000
   
-  # Sand (< 7% clay)
-  texture[clay < 7 & sand >= 85] <- 1  # Sand
-  texture[clay < 7 & sand >= 70 & sand < 85] <- 2  # Loamy sand
+  # pH: pH*10 to pH (divide by 10)
+  soil[["pH_0-5cm"]]     <- .get_soil_layer(soil, "phh2o_0-5cm")  / 10
   
-  writeRaster(texture, texture_file, overwrite = TRUE, datatype = "INT1U")
-  cat("  Soil texture class calculated ???\n")
-}
-
-# ============================================================================
-# 3. PREPARE RICE MASK ON CLIMATE GRID
-# ============================================================================
-
-cat("\n=== PREPARING RICE MASK ===\n")
-
-rice_raw_file <- file.path(base_dir, "rice mask/rice_mask_mm/spam2020_ha_rice_mmr.tif")
-rice_mask_file <- file.path(base_dir, "data/raw/mask/spam2020_rice_mmr_on_climategrid.tif")
-
-if (file.exists(rice_raw_file)) {
-  cat("Processing SPAM 2020 rice mask...\n")
+  message("  Units converted")
   
-  rice <- rast(rice_raw_file)
-  rice_crop <- crop(rice, mmr_boundary)
-  rice_resampled <- resample(rice_crop, ref_grid, method = "bilinear")
-  rice_mask <- rice_resampled > 0
+  # Porosity from bulk density (particle density = 2.65 g/cm3)
+  soil[["poros_0-5cm"]] <- 1 - (soil[["bdod_0-5cm"]] / 2.65)
   
-  writeRaster(rice_mask, rice_mask_file, overwrite = TRUE)
-  cat(sprintf("  Rice mask created: %d rice cells ???\n", global(rice_mask, "sum", na.rm = TRUE)$sum))
+  # Texture classification (USDA) using values to avoid extent issues
+  clay_vals <- terra::values(soil[["clay_0-5cm"]]) * 100
+  sand_vals <- terra::values(soil[["sand_0-5cm"]]) * 100
+  silt_vals <- terra::values(soil[["silt_0-5cm"]]) * 100
+  
+  texture_vals <- rep(4L, length(clay_vals))  # Default: loam
+  texture_vals[clay_vals > 40 & sand_vals > 45]                                             <- 10L  # Sandy clay
+  texture_vals[clay_vals > 40 & silt_vals > 40]                                             <- 11L  # Silty clay
+  texture_vals[clay_vals > 40 & sand_vals <= 45 & silt_vals <= 40]                          <- 12L  # Clay
+  texture_vals[clay_vals >= 27 & clay_vals <= 40 & sand_vals > 20 & sand_vals < 45]         <-  7L  # Sandy clay loam
+  texture_vals[clay_vals >= 27 & clay_vals <= 40 & silt_vals > 40]                          <-  9L  # Silty clay loam
+  texture_vals[clay_vals >= 27 & clay_vals <= 40 & sand_vals >= 20 & sand_vals <= 45 & silt_vals <= 40] <- 8L  # Clay loam
+  texture_vals[clay_vals < 27 & clay_vals >= 7 & sand_vals < 50 & silt_vals >= 28]          <-  5L  # Silt loam
+  texture_vals[clay_vals < 27 & clay_vals >= 7 & silt_vals >= 80]                           <-  6L  # Silt
+  texture_vals[clay_vals < 27 & clay_vals >= 7 & sand_vals >= 23 & sand_vals < 52 & silt_vals < 50] <- 4L  # Loam
+  texture_vals[clay_vals < 27 & clay_vals >= 7 & sand_vals >= 50]                           <-  3L  # Sandy loam
+  texture_vals[clay_vals < 7  & sand_vals >= 85]                                            <-  1L  # Sand
+  texture_vals[clay_vals < 7  & sand_vals >= 70 & sand_vals < 85]                           <-  2L  # Loamy sand
+  
+  texture <- soil[["clay_0-5cm"]]
+  terra::values(texture) <- texture_vals
+  names(texture) <- "texture_0-5cm"
+  soil <- c(soil, texture)
+  rm(clay_vals, sand_vals, silt_vals, texture_vals, texture)
+  
+  
+  # Resample to climate grid (using elevation as reference)
+  message("  Resampling soil to climate grid...")
+  soil2 <- terra::resample(soil, elv_ref, "average", filename = soil_agg_tif, overwrite = TRUE)
+  rm(elv_ref)
+  message("✓ Soil data processed")
 } else {
-  cat("ERROR: Rice mask file not found!\n")
-  cat(sprintf("Expected: %s\n", rice_raw_file))
+  message("✓ Soil data already exists")
+  soil2 <- terra::rast(soil_agg_tif)
 }
+message("✓ Soil data ready in DNDC units")
 
-# ============================================================================
-# 4. CREATE CELLS TABLE
-# ============================================================================
+# -----------------------------------------------------------------------------
+# 5) Rice mask and cells table
+# -----------------------------------------------------------------------------
+message("=== Creating Rice Cells Table ===")
+cells_rds <- file.path("data", "cells.rds")
 
-cat("\n=== CREATING CELLS TABLE ===\n")
-
-if (file.exists(rice_mask_file)) {
-  rice_mask <- rast(rice_mask_file)
-  rice_area_file <- file.path(base_dir, "rice mask/rice_mask_mm/spam2020_ha_rice_mmr.tif")
-  rice_area <- rast(rice_area_file) %>% 
-    crop(mmr_boundary) %>% 
-    resample(ref_grid, method = "bilinear")
+if (!file.exists(cells_rds)){
+  # Load Myanmar admin boundary
+  aoi <- geodata::gadm("Myanmar", level = 1, path = raw_dir)
   
-  # Extract rice cells
-  cells_df <- as.data.frame(rice_mask, xy = TRUE, cells = TRUE) %>%
-    filter(!is.na(lyr.1) & lyr.1 > 0) %>%
-    rename(cell_id = cell, lon = x, lat = y) %>%
-    select(cell_id, lon, lat)
+  # Create base grid from elevation
+  elv_for_cells <- terra::rast(elv_tif)
+  r <- terra::rast(elv_for_cells)
+  r <- mask(init(r, "cell"), aoi, touches = TRUE)
   
-  # Add rice area
-  rice_values <- terra::extract(rice_area, cells_df[, c("lon", "lat")])
-  cells_df$rice_area <- rice_values[[2]]
+  # Load SPAM rice area
+  rice_rast <- geodata::crop_spam(crop = "rice", var = "area", raw_dir) |> 
+    terra::crop(aoi, mask = TRUE)
+  rice_rast <- resample(rice_rast[[1]], r, "sum") > 0
+  r <- mask(r, rice_rast, maskvalue = FALSE)
+  cells <- data.frame(r)[,1]
   
-  # Add ADM1 information
-  cells_sf <- st_as_sf(cells_df, coords = c("lon", "lat"), crs = st_crs(mmr_boundary))
-  cells_with_adm <- st_join(cells_sf, mmr_boundary["ADM1_EN"])
-  cells_df$adm1 <- cells_with_adm$ADM1_EN
+  # Get xy coordinates and elevation
+  xy <- data.frame(xyFromCell(r, cells))
+  xy$elevation <- round(elv_for_cells[cells])
+  xy$cell <- cells
   
-  # Save cells table
-  cells_file <- file.path(base_dir, "data/processed/tables/cells_rice_0p5deg_mmr.rds")
-  saveRDS(cells_df, cells_file)
+  # Extract soil properties for each cell
+  soil_data <- terra::extract(soil2, cells)
+  xy <- cbind(xy, soil_data[, -1])  # Remove ID column
   
-  cat(sprintf("  Cells table created: %d rice cells\n", nrow(cells_df)))
-  cat(sprintf("  Saved to: %s\n", cells_file))
-  
-  # Print summary by region
-  cat("\n  Rice cells by region:\n")
-  print(table(cells_df$adm1))
-  
+  saveRDS(xy, cells_rds)
+  message(sprintf("✓ Created cells table with %d rice cells", nrow(xy)))
 } else {
-  cat("ERROR: Cannot create cells table - rice mask not found\n")
+  xy <- readRDS(cells_rds)
+  message(sprintf("✓ Loaded existing cells table with %d rice cells", nrow(xy)))
 }
 
-# ============================================================================
-# SUMMARY
-# ============================================================================
+# Print summary
+message("\n=== SUMMARY ===")
+message(sprintf("Climate data: 2005-2024 (%d years)", length(years)))
+message(sprintf("Variables: %s", paste(c("tmax", "tmin", "tavg", "prec", "wind", "srad", "rhum"), collapse = ", ")))
+message(sprintf("Grid resolution: 0.5° x 0.5°"))
+message(sprintf("Rice cells: %d", nrow(xy)))
+message(sprintf("Cells table saved: %s", cells_rds))
+message("\n✓ Step 1 complete. Ready for Step 2 (make_climate_files.R)")
 
-cat("\n")
-cat("=" %>% rep(70) %>% paste(collapse = ""))
-cat("\n=== DATA PREPARATION COMPLETE ===\n")
-cat("=" %>% rep(70) %>% paste(collapse = ""))
-cat("\n\n")
-
-cat("Downloaded and processed:\n")
-cat(sprintf("  ??? Climate data: %d years ?? 7 variables\n", length(sim_years)))
-cat("  ??? Soil data: 6+ variables\n")
-cat("  ??? Rice mask: Myanmar rice cultivation areas\n")
-cat(sprintf("  ??? Cells table: %d grid cells\n", nrow(cells_df)))
-cat("\n")
-cat("Next step: Run 2_make_climate_file.R to generate DNDC climate files\n")
-cat("\n")
+##### END OF: 1_get_wth_soil_data.R #####
