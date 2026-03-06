@@ -80,10 +80,8 @@ keep_cols <- list(
   FieldManage = c("Day","Irrigation (mm)","Fertilizer (kgN/ha)","Manure (kgN/ha)")
 )
 
-# ── Multi_year_summary column names (from DNDC manual + actual file) ────────
-# Manual-defined order (52 columns). If file has more, extras kept as-is.
-# NOTE: if your file has 72 columns, run names(fread(path, nrows=0)) once
-# and paste below to fill in positions 53-72.
+# ── Multi_year_summary column names (from DNDC manual + actual file)
+
 annual_col_names <- c(
   "Year",
   # Crop biomass (3 crops x 3 components)
