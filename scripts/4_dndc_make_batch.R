@@ -1,9 +1,5 @@
 ##### 4_dndc_make_batch.R #####
 # Creates DNDC batch file listing all cell .dnd input files
-# Format required by DNDC (Tools -> Run Batch):
-#   Line 1 : total number of .dnd files
-#   Line 2+ : full Windows path to each .dnd file
-# Output: myanmar_rice_batch.txt  (load this in DNDC batch mode)
 
 # ---- Paths ----
 input_dir  <- "C:\\DNDC\\simulate_dndc\\dndc_inputs\\input_files"
